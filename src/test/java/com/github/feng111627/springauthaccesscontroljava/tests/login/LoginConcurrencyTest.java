@@ -3,6 +3,7 @@ package com.github.feng111627.springauthaccesscontroljava.tests.login;
 import com.github.feng111627.springauthaccesscontroljava.login.LoginError;
 import com.github.feng111627.springauthaccesscontroljava.login.LoginException;
 import com.github.feng111627.springauthaccesscontroljava.login.LoginRateLimiter;
+import com.github.feng111627.springauthaccesscontroljava.login.SourceRateLimiter;
 import com.github.feng111627.springauthaccesscontroljava.security.PasswordEncoder;
 import com.github.feng111627.springauthaccesscontroljava.security.TimeSource;
 import com.github.feng111627.springauthaccesscontroljava.security.TokenPair;
@@ -48,6 +49,11 @@ class LoginConcurrencyTest {
     private static final long LOCK_MILLIS = 300_000;
     private static final int MAX_WINDOW_ATTEMPTS = 10;
     private static final long WINDOW_MILLIS = 600_000;
+    // This test class exercises the per-username dimension only; the source
+    // dimension is configured with an unreachable threshold so it can never
+    // interfere. SourceRateLimitTest covers the source dimension itself.
+    private static final int UNREACHABLE_SOURCE_LIMIT = 1_000_000;
+    private static final String SOURCE = "test-source";
 
     private final AtomicLong clock = new AtomicLong(5_000_000L);
 
@@ -60,6 +66,8 @@ class LoginConcurrencyTest {
         TimeSource timeSource = clock::get;
         limiter = new LoginRateLimiter(timeSource, MAX_FAILURES, LOCK_MILLIS,
                 MAX_WINDOW_ATTEMPTS, WINDOW_MILLIS);
+        SourceRateLimiter sourceLimiter = new SourceRateLimiter(timeSource,
+                UNREACHABLE_SOURCE_LIMIT, WINDOW_MILLIS);
 
         PasswordEncoder encoder = new PasswordEncoder(10_000);
         TokenService tokenService = new TokenService(
@@ -71,12 +79,12 @@ class LoginConcurrencyTest {
         users.save(new User("carol", encoder.encode("correct-horse"),
                 Set.of(Role.VIEWER), Set.of(), true));
         authService = new AuthService(users, encoder, tokenService,
-                revocation, limiter);
+                revocation, limiter, sourceLimiter);
     }
 
     private LoginError attemptLogin(String user, String password) {
         try {
-            authService.login(user, password);
+            authService.login(user, password, SOURCE);
             return null;
         } catch (LoginException e) {
             return e.getError();
@@ -109,7 +117,7 @@ class LoginConcurrencyTest {
             // Even the correct password is refused while locked, with a
             // distinct reason (not BAD_CREDENTIALS).
             LoginException locked = assertThrows(LoginException.class,
-                    () -> authService.login("bob", "correct-horse"));
+                    () -> authService.login("bob", "correct-horse", SOURCE));
             assertEquals(LoginError.ACCOUNT_LOCKED, locked.getError());
         }
 
@@ -123,7 +131,7 @@ class LoginConcurrencyTest {
 
             clock.addAndGet(LOCK_MILLIS + 1);
             assertEquals(0, limiter.consecutiveFailures("bob"));
-            TokenPair pair = authService.login("bob", "correct-horse");
+            TokenPair pair = authService.login("bob", "correct-horse", SOURCE);
             assertNotNull(pair.accessToken());
         }
 
@@ -132,7 +140,7 @@ class LoginConcurrencyTest {
         void successResetsCounter() {
             attemptLogin("bob", "wrong");
             attemptLogin("bob", "wrong");
-            TokenPair pair = authService.login("bob", "correct-horse");
+            TokenPair pair = authService.login("bob", "correct-horse", SOURCE);
             assertNotNull(pair);
             assertEquals(0, limiter.consecutiveFailures("bob"));
         }
@@ -171,7 +179,7 @@ class LoginConcurrencyTest {
 
             // After the whole window passes, attempts flow normally again.
             clock.addAndGet(WINDOW_MILLIS + 1);
-            TokenPair pair = authService.login("carol", "correct-horse");
+            TokenPair pair = authService.login("carol", "correct-horse", SOURCE);
             assertNotNull(pair.accessToken());
         }
 

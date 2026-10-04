@@ -54,6 +54,14 @@ class AuthFlowIntegrationTest {
         return rest.postForEntity(url(path), body, String.class);
     }
 
+    private ResponseEntity<String> postFromSource(String path, Object body,
+                                                  String clientIp) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.add("X-Forwarded-For", clientIp);
+        return rest.exchange(url(path), HttpMethod.POST,
+                new HttpEntity<>(body, headers), String.class);
+    }
+
     private JsonNode loginAs(String username) {
         ResponseEntity<String> response = post("/api/auth/login",
                 Map.of("username", username, "password", PASSWORD));
@@ -127,6 +135,47 @@ class AuthFlowIntegrationTest {
             assertEquals("editor", me.get("username").asText());
             assertTrue(me.get("roles").toString().contains("EDITOR"));
             assertTrue(me.get("permissions").toString().contains("article:publish"));
+        }
+    }
+
+    @Nested
+    @DisplayName("来源维度限流 (HTTP)")
+    class SourceRateLimitOverHttp {
+
+        @Test
+        @DisplayName("同一来源(X-Forwarded-For)轮换不存在用户名 -> 429 LOGIN_SOURCE_RATE_LIMITED; 换来源不受影响")
+        void sameSourceIsThrottledWhileOtherSourcesAreNot() {
+            // Default config: a source may accumulate 20 failures per 60s
+            // across ALL usernames; each individual username here fails once.
+            String hotSource = "203.0.113.10";
+            for (int i = 0; i < 20; i++) {
+                ResponseEntity<String> response = postFromSource("/api/auth/login",
+                        Map.of("username", "no-such-user-" + i, "password", "x"),
+                        hotSource);
+                assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode(),
+                        response.getBody());
+                assertEquals("LOGIN_BAD_CREDENTIALS",
+                        errorBody(response).get("code").asText());
+            }
+
+            // The 21st failure from the same source is throttled as a whole,
+            // with a code distinct from both BAD_CREDENTIALS and ACCOUNT_LOCKED.
+            ResponseEntity<String> throttled = postFromSource("/api/auth/login",
+                    Map.of("username", "no-such-user-20", "password", "x"),
+                    hotSource);
+            assertEquals(HttpStatus.TOO_MANY_REQUESTS, throttled.getStatusCode(),
+                    throttled.getBody());
+            assertEquals("LOGIN_SOURCE_RATE_LIMITED",
+                    errorBody(throttled).get("code").asText());
+
+            // A different source (different X-Forwarded-For) is unaffected.
+            ResponseEntity<String> otherSource = postFromSource("/api/auth/login",
+                    Map.of("username", "no-such-user-20", "password", "x"),
+                    "203.0.113.11");
+            assertEquals(HttpStatus.UNAUTHORIZED, otherSource.getStatusCode(),
+                    otherSource.getBody());
+            assertEquals("LOGIN_BAD_CREDENTIALS",
+                    errorBody(otherSource).get("code").asText());
         }
     }
 
