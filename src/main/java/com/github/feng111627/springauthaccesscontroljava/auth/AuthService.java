@@ -22,8 +22,10 @@ import org.springframework.stereotype.Service;
  *
  * <p>Failure outcomes are always distinguishable:
  * <ul>
+ *   <li>{@link LoginError#SOURCE_RATE_LIMITED} is decided before any secret is
+ *       checked when one source produced too many failures across usernames;</li>
  *   <li>{@link LoginError#RATE_LIMITED} / {@link LoginError#ACCOUNT_LOCKED}
- *       are decided by {@link LoginRateLimiter} before any secret is checked;</li>
+ *       are the two per-username gates, also evaluated before the secret check;</li>
  *   <li>{@link LoginError#BAD_CREDENTIALS} covers both unknown username and
  *       wrong password with the same response shape;</li>
  *   <li>{@link LoginError#ACCOUNT_DISABLED} is reported only after correct
@@ -54,57 +56,76 @@ public class AuthService {
     }
 
     public TokenPair login(String username, String rawPassword) {
+        return login(LoginRateLimiter.UNKNOWN_SOURCE, username, rawPassword);
+    }
+
+    /**
+     * Login attributed to a source (e.g. client IP). The full decision —
+     * source gate, per-username gate, credential check and counter updates —
+     * runs atomically under a fixed lock order (source first, username
+     * second), so concurrent attempts cannot lose counts or observe two
+     * contradictory verdicts.
+     */
+    public TokenPair login(String source, String username, String rawPassword) {
         if (username == null || username.isBlank() || rawPassword == null) {
             throw new LoginException(LoginError.BAD_CREDENTIALS,
                     "Username and password are required");
         }
+        String effectiveSource = (source == null || source.isBlank())
+                ? LoginRateLimiter.UNKNOWN_SOURCE : source;
 
-        // Serialize the whole decision per username so the rate-limit/lock
-        // gate and the resulting counter update can never interleave. Other
-        // usernames are unaffected and still run in parallel.
-        synchronized (loginRateLimiter.lockFor(username)) {
-            // Gate first: a locked or throttled username never reaches the
-            // password check (no oracle about the password).
-            loginRateLimiter.assertAttemptAllowed(username);
+        // Fixed lock order: source lock -> username lock. Every caller uses
+        // the same order, so the two locks can never form a deadlock cycle;
+        // the two gate checks and the resulting counter updates cannot
+        // interleave. Other sources/usernames proceed fully in parallel.
+        synchronized (loginRateLimiter.sourceLockFor(effectiveSource)) {
+            synchronized (loginRateLimiter.lockFor(username)) {
+                // Gates first: a source-throttled, locked or username-throttled
+                // attempt never reaches the password check (no password oracle),
+                // and a gate-blocked attempt adds nothing to either window.
+                loginRateLimiter.assertAttemptAllowed(effectiveSource, username);
 
-            User user = userRepository.findByUsername(username).orElse(null);
-            if (user == null) {
-                // Count failures against the presented username so an attacker
-                // probing non-existent accounts is throttled just the same.
-                loginRateLimiter.recordFailure(username);
-                throw new LoginException(LoginError.BAD_CREDENTIALS,
-                        "Invalid username or password");
+                User user = userRepository.findByUsername(username).orElse(null);
+                if (user == null) {
+                    // Count against BOTH dimensions: probing non-existent
+                    // accounts from one source is exactly the spray the
+                    // source window must catch.
+                    loginRateLimiter.recordFailure(effectiveSource, username);
+                    throw new LoginException(LoginError.BAD_CREDENTIALS,
+                            "Invalid username or password");
+                }
+
+                boolean passwordMatches;
+                try {
+                    passwordMatches = passwordEncoder.matches(
+                            rawPassword, user.getPasswordHash());
+                } catch (Exception e) {
+                    loginRateLimiter.recordFailure(effectiveSource, username);
+                    throw new LoginException(LoginError.BAD_CREDENTIALS,
+                            "Invalid username or password");
+                }
+
+                if (!passwordMatches) {
+                    loginRateLimiter.recordFailure(effectiveSource, username);
+                    throw new LoginException(LoginError.BAD_CREDENTIALS,
+                            "Invalid username or password");
+                }
+
+                if (!user.isEnabled()) {
+                    // Correct credentials, disabled account: distinct outcome.
+                    // Counts as neither an account failure nor a source failure
+                    // and issues no tokens.
+                    throw new LoginException(LoginError.ACCOUNT_DISABLED,
+                            "Account is disabled; contact an administrator");
+                }
+
+                loginRateLimiter.recordSuccess(effectiveSource, username);
+                TokenPair pair = tokenService.issue(
+                        user.getUsername(), user.getTokenEpoch());
+                log.info("Login succeeded for user '{}' from source '{}' at epoch {}",
+                        username, effectiveSource, user.getTokenEpoch());
+                return pair;
             }
-
-            boolean passwordMatches;
-            try {
-                passwordMatches = passwordEncoder.matches(
-                        rawPassword, user.getPasswordHash());
-            } catch (Exception e) {
-                loginRateLimiter.recordFailure(username);
-                throw new LoginException(LoginError.BAD_CREDENTIALS,
-                        "Invalid username or password");
-            }
-
-            if (!passwordMatches) {
-                loginRateLimiter.recordFailure(username);
-                throw new LoginException(LoginError.BAD_CREDENTIALS,
-                        "Invalid username or password");
-            }
-
-            if (!user.isEnabled()) {
-                // Correct credentials, disabled account: distinct outcome.
-                // Does not count as a credential failure and does not issue tokens.
-                throw new LoginException(LoginError.ACCOUNT_DISABLED,
-                        "Account is disabled; contact an administrator");
-            }
-
-            loginRateLimiter.recordSuccess(username);
-            TokenPair pair = tokenService.issue(
-                    user.getUsername(), user.getTokenEpoch());
-            log.info("Login succeeded for user '{}' at epoch {}",
-                    username, user.getTokenEpoch());
-            return pair;
         }
     }
 

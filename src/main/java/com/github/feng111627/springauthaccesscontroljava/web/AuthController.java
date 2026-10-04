@@ -6,6 +6,7 @@ import com.github.feng111627.springauthaccesscontroljava.web.dto.LoginRequest;
 import com.github.feng111627.springauthaccesscontroljava.web.dto.LogoutRequest;
 import com.github.feng111627.springauthaccesscontroljava.web.dto.RefreshRequest;
 import com.github.feng111627.springauthaccesscontroljava.web.dto.TokenResponse;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -24,9 +25,12 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    public TokenResponse login(@RequestBody LoginRequest request) {
+    public TokenResponse login(@RequestBody LoginRequest request,
+                               HttpServletRequest httpRequest) {
         requireBody(request);
-        TokenPair pair = authService.login(request.username(), request.password());
+        String source = ClientSourceResolver.resolve(httpRequest);
+        TokenPair pair = authService.login(
+                source, request.username(), request.password());
         return toResponse(pair);
     }
 

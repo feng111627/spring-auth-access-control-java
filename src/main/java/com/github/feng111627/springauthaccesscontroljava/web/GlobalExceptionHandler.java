@@ -82,8 +82,8 @@ public class GlobalExceptionHandler {
             case BAD_CREDENTIALS, ACCOUNT_DISABLED -> HttpStatus.UNAUTHORIZED;
             // Account lockout: 423 Locked (distinct from transient throttling).
             case ACCOUNT_LOCKED -> HttpStatus.LOCKED;
-            // Sliding-window throttle: 429 Too Many Requests.
-            case RATE_LIMITED -> HttpStatus.TOO_MANY_REQUESTS;
+            // Sliding-window throttle (per-username or per-source): 429.
+            case RATE_LIMITED, SOURCE_RATE_LIMITED -> HttpStatus.TOO_MANY_REQUESTS;
         };
         return respond(status, "LOGIN_" + error.name(), ex.getMessage());
     }
